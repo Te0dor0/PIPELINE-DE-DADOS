@@ -1,0 +1,293 @@
+"""
+Pipeline de Dados ETL Automatizado
+Desenvolvido por: Diego Teodoro
+
+Este script orquestra o fluxo completo de extração, transformação, validação, carga e geração de métricas de dados de vendas e clientes.
+Ele foi projetado para ser robusto, observável e pronto para produção.
+"""
+import sys
+from pathlib import Path
+import json
+from datetime import datetime
+
+# Adicionar o diretório raiz ao path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.extract.extract_data import DataExtractor
+from src.transform.transform_data import DataTransformer
+from src.quality.data_validator import DataValidator
+from src.load.load_data import DataLoader
+from src.config import ETLLogger
+
+
+def run_etl_pipeline():
+    """
+    Executa o pipeline completo de vendas e clientes, orquestrando as etapas de extração, transformação, validação, carga e geração de métricas.
+    """
+    logger = ETLLogger(__name__)
+    logger.logger.info("=" * 60)
+    logger.logger.info("INICIANDO PROCESSAMENTO ETL - BY DIEGO TEODORO")
+    logger.logger.info("=" * 60)
+    
+    try:
+        # ============================================================
+        # ETAPA 1: EXTRACT (Extração)
+        # ============================================================
+        logger.logger.info("\n[ETAPA 1] EXTRAÇÃO DE DADOS (Extract)")
+        logger.logger.info("-" * 60)
+        
+        extractor = DataExtractor()
+        
+        # Extração de dados de vendas (Mock Data para demonstração)
+        df_sales = extractor.extract_mock_sales_data(num_records=100)
+        logger.logger.info(f"✓ Vendas extraídas: {len(df_sales)} registros")
+        
+        # Extração de dados de clientes (Mock Data para demonstração)
+        df_customers = extractor.extract_mock_customers_data(num_records=50)
+        logger.logger.info(f"✓ Clientes extraídos: {len(df_customers)} registros")
+        
+        # ============================================================
+        # ETAPA 2: TRANSFORM (Transformação)
+        # ============================================================
+        logger.logger.info("\n[ETAPA 2] TRANSFORMAÇÃO DE DADOS (Transform)")
+        logger.logger.info("-" * 60)
+        
+        transformer = DataTransformer()
+        
+        # 2.1 Padronizar nomes de colunas
+        df_sales = transformer.standardize_column_names(df_sales)
+        df_customers = transformer.standardize_column_names(df_customers)
+        logger.logger.info("✓ Nomes de colunas padronizados")
+        
+        # 2.2 Garantir tipos de dados corretos
+        df_sales = transformer.handle_missing_values(
+            df_sales,
+            strategy=\'fill\', 
+            columns=["quantity", "unit_price", "discount"],
+            fill_value=0
+        )
+        logger.logger.info("✓ Valores ausentes em vendas tratados")
+        df_sales = transformer.enforce_data_types(
+            df_sales,
+            {
+                'sale_id': 'int',
+                'customer_id': 'int',
+                'product_id': 'int',
+                'sale_date': 'datetime',
+                'quantity': 'int',
+                'unit_price': 'float',
+                'discount': 'float'
+            }
+        )
+        logger.logger.info("✓ Tipos de dados das vendas corrigidos")
+        
+        df_customers = transformer.enforce_data_types(
+            df_customers,
+            {
+                'customer_id': 'int',
+                'registration_date': 'datetime'
+            }
+        )
+        logger.logger.info("✓ Tipos de dados dos clientes corrigidos")
+        
+        # 2.3 Adicionar colunas calculadas
+        df_sales = transformer.add_calculated_columns(
+            df_sales,
+            {
+                'subtotal': 'quantity * unit_price',
+                'discount_amount': 'quantity * unit_price * discount',
+                'total_amount': 'quantity * unit_price * (1 - discount)'
+            }
+        )
+        logger.logger.info("✓ Colunas calculadas adicionadas")
+        
+        # 2.4 Filtrar apenas vendas completadas
+        df_sales_completed = transformer.filter_data(
+            df_sales,
+            "status == 'completed'"
+        )
+        logger.logger.info(f"✓ Filtradas {len(df_sales_completed)} vendas completadas")
+        
+        # 2.5 Remover duplicatas
+        df_sales_completed = transformer.remove_duplicates(
+            df_sales_completed,
+            subset=['sale_id']
+        )
+        logger.logger.info("✓ Duplicatas removidas")
+        
+        # 2.6 Fazer join entre vendas e clientes
+        df_enriched = transformer.join_dataframes(
+            df_sales_completed,
+            df_customers,
+            on='customer_id',
+            how='left'
+        )
+        logger.logger.info(f"✓ Join realizado: {len(df_enriched)} registros")
+        
+        # 2.7 Criar agregação por cliente
+        df_customer_summary = transformer.aggregate_data(
+            df_enriched,
+            group_by=['customer_id', 'first_name', 'last_name', 'city'],
+            aggregations={
+                'total_amount': 'sum',
+                'sale_id': 'count',
+                'quantity': 'sum'
+            }
+        )
+        df_customer_summary.columns = [
+            'customer_id', 'first_name', 'last_name', 'city',
+            'total_revenue', 'num_sales', 'total_items'
+        ]
+        logger.logger.info(f"✓ Agregação por cliente: {len(df_customer_summary)} clientes")
+        
+        # ============================================================
+        # ETAPA 3: QUALITY (Validação de Qualidade)
+        # ============================================================
+        logger.logger.info("\n[ETAPA 3] VALIDAÇÃO DE QUALIDADE (Quality)")
+        logger.logger.info("-" * 60)
+        
+        validator = DataValidator()
+        
+        # Validar dados enriquecidos
+        validation_config = {
+            "required_columns": ['sale_id', 'customer_id', 'total_amount'],
+            "expected_types": {
+                'sale_id': 'int',
+                'customer_id': 'int',
+                'total_amount': 'float'
+            },
+            "value_ranges": {
+                'total_amount': {'min': 0},
+                'quantity': {'min': 1}
+            }
+        }
+        
+        validation_summary = validator.run_all_validations(
+            df_enriched,
+            validation_config
+        )
+        
+        logger.logger.info(f"✓ Validações executadas: {validation_summary['total_checks']}")
+        logger.logger.info(f"✓ Validações aprovadas: {validation_summary['passed_checks']}")
+        
+        if not validation_summary['all_passed']:
+            logger.logger.warning("⚠ Algumas validações falharam!")
+            print("\n" + validator.get_validation_report())
+        else:
+            logger.logger.info("✓ Todas as validações passaram!")
+        
+        # ============================================================
+        # ETAPA 4: LOAD (Carga)
+        # ============================================================
+        logger.logger.info("\n[ETAPA 4] CARGA DE DADOS (Load)")
+        logger.logger.info("-" * 60)
+        
+        loader = DataLoader()
+        
+        # 4.1 Carregar vendas enriquecidas no SQLite
+        loader.load_to_sqlite(
+            df_enriched,
+            table_name='sales_enriched',
+            if_exists='replace',
+            create_index=True,
+            index_columns=['customer_id', 'sale_date']
+        )
+        logger.logger.info("✓ Vendas enriquecidas carregadas no SQLite")
+        
+        # 4.2 Carregar resumo de clientes no SQLite
+        loader.load_to_sqlite(
+            df_customer_summary,
+            table_name='customer_summary',
+            if_exists='replace',
+            create_index=True,
+            index_columns=['customer_id']
+        )
+        logger.logger.info("✓ Resumo de clientes carregado no SQLite")
+        
+        # 4.3 Exportar para CSV (backup)
+        csv_path = loader.load_to_csv(
+            df_enriched,
+            file_name='sales_enriched.csv'
+        )
+        logger.logger.info(f"✓ Backup CSV criado: {csv_path}")
+        
+        # 4.4 Exportar para Parquet (formato otimizado)
+        parquet_path = loader.load_to_parquet(
+            df_enriched,
+            file_name=\'sales_enriched.parquet\'
+        )
+        logger.logger.info(f"✓ Arquivo Parquet criado: {parquet_path}")
+
+        # 4.5 Carregar para DuckDB (para análises rápidas)
+        duckdb_path = str(OUTPUT_DIR / "analytics.duckdb")
+        loader.load_to_duckdb(
+            df_enriched,
+            table_name=\'sales_data\',
+            db_path=duckdb_path,
+            if_exists=\'replace\'
+        )
+        loader.load_to_duckdb(
+            df_customer_summary,
+            table_name=\'customer_summary\',
+            db_path=duckdb_path,
+            if_exists=\'replace\'
+        )
+        logger.logger.info(f"✓ Dados carregados no DuckDB: {duckdb_path}")
+        
+        # ============================================================
+        # FINALIZAÇÃO
+        # ============================================================
+        logger.logger.info("\n" + "=" * 60)
+        logger.logger.info("PIPELINE ETL CONCLUÍDO COM SUCESSO! Dados carregados em SQLite, Parquet e DuckDB. Métricas geradas.")
+        logger.logger.info("=" * 60)
+        logger.logger.info(f"Total de vendas processadas: {len(df_enriched)}")
+        logger.logger.info(f"Total de clientes únicos: {len(df_customer_summary)}")
+        logger.logger.info(f"Receita total: R$ {df_customer_summary["total_revenue"].sum():.2f}")
+
+        # ============================================================
+        # ETAPA 5: REPORT (Geração de Métricas/Relatórios)
+        # ============================================================
+        logger.logger.info("\n[ETAPA 5] GERAÇÃO DE MÉTRICAS E RELATÓRIOS")
+        logger.logger.info("-" * 60)
+        # Placeholder para geração de métricas ou relatórios mais complexos
+        # Salvar métricas em um arquivo JSON para observabilidade
+        metrics = {
+            "timestamp": datetime.now().isoformat(),
+            "total_sales_records": len(df_enriched),
+            "total_unique_customers": len(df_customer_summary),
+            "total_revenue_generated": float(df_customer_summary["total_revenue"].sum()),
+            "validation_status": "Passed" if validation_summary["all_passed"] else "Failed",
+            "validation_report_summary": validation_summary["report"]
+        }
+        metrics_file_path = OUTPUT_DIR / "pipeline_metrics.json"
+        with open(metrics_file_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=4)
+        logger.logger.info(f"✓ Métricas salvas em: {metrics_file_path}")
+        logger.logger.info("-" * 60)
+        logger.logger.info("=" * 60)
+        
+        return {
+            'status': 'success',
+            'sales_processed': len(df_enriched),
+            'customers': len(df_customer_summary),
+            'total_revenue': float(df_customer_summary['total_revenue'].sum()),
+            'validation_passed': validation_summary['all_passed']
+        }
+        
+    except Exception as e:
+        logger.log_error(e, "Pipeline ETL")
+        logger.logger.error("=" * 60)
+        logger.logger.error("PIPELINE ETL FALHOU! Verifique os logs para mais detalhes.")
+        logger.logger.error("=" * 60)
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        result = run_etl_pipeline()
+        print("\n✓ Pipeline executado com sucesso!")
+        print(f"Resultado: {result}")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n✗ Erro na execução do pipeline: {e}")
+        sys.exit(1)

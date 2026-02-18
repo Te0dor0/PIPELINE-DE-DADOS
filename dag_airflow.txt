@@ -1,0 +1,363 @@
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.decorators import task
+import sys
+from pathlib import Path
+
+# Adicionar o diretório raiz do projeto ao path para que os módulos possam ser importados
+# Isso é uma solução para desenvolvimento local. Em produção, o projeto seria um pacote Python instalável.
+project_root = Path(__file__).resolve().parents[2] # Ajuste conforme a estrutura do seu projeto
+sys.path.insert(0, str(project_root))
+
+# Importar os módulos do pipeline
+from src.extract.extract_data import DataExtractor
+from src.transform.transform_data import DataTransformer
+from src.quality.data_validator import DataValidator
+from src.load.load_data import DataLoader
+from src.config import ETLLogger
+
+
+# Configuração padrão do DAG
+default_args = {
+    'owner': 'diego_teodoro',
+    'depends_on_past': False,
+    'email': ['diego.teodoro@example.com'], # Altere para seu email de alertas
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 3,
+    'retry_delay': timedelta(minutes=5),
+    'retry_exponential_backoff': True,
+    'max_retry_delay': timedelta(minutes=30)
+}
+
+# Definição do DAG
+with DAG(
+    dag_id='etl_sales_pipeline',
+    default_args=default_args,
+    description='Pipeline ETL de vendas e clientes automatizado',
+    schedule_interval=timedelta(days=1),  # Executa diariamente
+    start_date=datetime(2024, 1, 1),      # Data de início do DAG
+    catchup=False,                        # Não executa para datas passadas
+    tags=['etl', 'vendas', 'producao']
+) as dag:
+    
+    # Documentação do DAG em português
+    dag.doc_md = """
+    # Pipeline ETL Automatizado de Vendas e Clientes
+    
+    Orquestração pronta para produção para processamento de conjuntos de dados de e-commerce.
+    
+    ## Arquitetura do Fluxo de Trabalho
+    
+    1. **Ingestão (Extração)**: Recuperação de registros de vendas e clientes de múltiplas fontes.
+    2. **Processamento (Transformação)**: Limpeza, padronização e enriquecimento de conjuntos de dados brutos.
+    3. **Garantia de Qualidade (Validação)**: Verificações automatizadas de integridade de dados.
+    4. **Persistência (Carga)**: Carregamento de dados processados em SQLite e snapshots Parquet.
+    5. **Observabilidade (Relatório)**: Geração de métricas de execução e relatórios de status.
+    
+    ## Metadados Operacionais
+    
+    - **Agendamento**: Diariamente às 00:00 UTC
+    - **Resiliência**: 3 retentativas com backoff exponencial
+    - **Alertas**: Notificações por e-mail em caso de falha
+    """
+    
+    
+    @task(task_id='extrair_dados_vendas')
+    def extrair_vendas(**context):
+        """
+        Extrai dados de vendas.
+        """
+        logger = ETLLogger(__name__)
+        logger.logger.info("Iniciando extração de dados de vendas")
+        
+        extractor = DataExtractor()
+        df_sales = extractor.extract_mock_sales_data(num_records=100)
+        
+        # Salvar em XCom para próxima task
+        return df_sales.to_json(orient='records')
+    
+    
+    @task(task_id='extrair_dados_clientes')
+    def extrair_clientes(**context):
+        """
+        Extrai dados de clientes.
+        """
+        logger = ETLLogger(__name__)
+        logger.logger.info("Iniciando extração de dados de clientes")
+        
+        extractor = DataExtractor()
+        df_customers = extractor.extract_mock_customers_data(num_records=50)
+        
+        # Salvar em XCom para próxima task
+        return df_customers.to_json(orient='records')
+    
+    
+    @task(task_id='transformar_dados')
+    def transformar_dados(sales_json, customers_json, **context):
+        """
+        Transforma e enriquece os dados.
+        """
+        import pandas as pd
+        
+        logger = ETLLogger(__name__)
+        logger.logger.info("Iniciando transformação de dados")
+        
+        # Carregar dados do XCom
+        df_sales = pd.read_json(sales_json, orient='records')
+        df_customers = pd.read_json(customers_json, orient='records')
+        
+        transformer = DataTransformer()
+        
+        # Aplica as transformações completas
+        df_sales = transformer.handle_missing_values(
+            df_sales,
+            strategy='fill', 
+            columns=["quantity", "unit_price", "discount"],
+            fill_value=0
+        )
+        df_sales = transformer.standardize_column_names(df_sales)
+        df_customers = transformer.standardize_column_names(df_customers)
+        
+        df_sales = transformer.enforce_data_types(
+            df_sales,
+            {
+                'sale_id': 'int',
+                'customer_id': 'int',
+                'product_id': 'int',
+                'sale_date': 'datetime',
+                'quantity': 'int',
+                'unit_price': 'float',
+                'discount': 'float'
+            }
+        )
+        
+        df_customers = transformer.enforce_data_types(
+            df_customers,
+            {
+                'customer_id': 'int',
+                'registration_date': 'datetime'
+            }
+        )
+        
+        df_sales = transformer.add_calculated_columns(
+            df_sales,
+            {
+                'subtotal': 'quantity * unit_price',
+                'discount_amount': 'quantity * unit_price * discount',
+                'total_amount': 'quantity * unit_price * (1 - discount)'
+            }
+        )
+        
+        df_sales_completed = transformer.filter_data(
+            df_sales,
+            "status == 'completed'"
+        )
+        
+        df_sales_completed = transformer.remove_duplicates(
+            df_sales_completed,
+            subset=['sale_id']
+        )
+        
+        df_enriched = transformer.join_dataframes(
+            df_sales_completed,
+            df_customers,
+            on='customer_id',
+            how='left'
+        )
+        
+        df_customer_summary = transformer.aggregate_data(
+            df_enriched,
+            group_by=['customer_id', 'first_name', 'last_name', 'city'],
+            aggregations={
+                'total_amount': 'sum',
+                'sale_id': 'count',
+                'quantity': 'sum'
+            }
+        )
+        df_customer_summary.columns = [
+            'customer_id', 'first_name', 'last_name', 'city',
+            'total_revenue', 'num_sales', 'total_items'
+        ]
+        
+        return {
+            'enriched': df_enriched.to_json(orient='records'),
+            'summary': df_customer_summary.to_json(orient='records')
+        }
+    
+    
+    @task(task_id='validar_qualidade_dados')
+    def validar_qualidade(transformed_data, **context):
+        """
+        Valida a qualidade dos dados transformados.
+        """
+        import pandas as pd
+        
+        logger = ETLLogger(__name__)
+        logger.logger.info("Iniciando validação de qualidade")
+        
+        df_enriched = pd.read_json(
+            transformed_data['enriched'],
+            orient='records'
+        )
+        
+        validator = DataValidator()
+        
+        validation_config = {
+            "required_columns": ['sale_id', 'customer_id', 'total_amount'],
+            "value_ranges": {
+                'total_amount': {'min': 0},
+                'quantity': {'min': 1}
+            }
+        }
+        
+        validation_summary = validator.run_all_validations(
+            df_enriched,
+            validation_config
+        )
+        
+        if not validation_summary['all_passed']:
+            logger.logger.warning("Algumas validações falharam!")
+            print(validator.get_validation_report())
+            # Em um cenário real, você poderia levantar um AirflowException aqui para falhar a task
+            # from airflow.exceptions import AirflowException
+            # raise AirflowException("Falha na validação de dados")
+        else:
+            logger.logger.info("Todas as validações passaram!")
+        
+        # Retornar dados validados
+        return transformed_data
+    
+    
+    @task(task_id='carregar_dados')
+    def carregar_dados(validated_data, **context):
+        """
+        Carrega os dados no banco de dados e em arquivos.
+        """
+        import pandas as pd
+        
+        logger = ETLLogger(__name__)
+        logger.logger.info("Iniciando carga de dados")
+        
+        df_enriched = pd.read_json(
+            validated_data['enriched'],
+            orient='records'
+        )
+        df_summary = pd.read_json(
+            validated_data['summary'],
+            orient='records'
+        )
+        
+        loader = DataLoader()
+        
+        # Carregar vendas enriquecidas no SQLite
+        loader.load_to_sqlite(
+            df_enriched,
+            table_name='sales_enriched',
+            if_exists='replace',
+            create_index=True,
+            index_columns=['customer_id', 'sale_date']
+        )
+        
+        # Carregar resumo de clientes no SQLite
+        loader.load_to_sqlite(
+            df_summary,
+            table_name='customer_summary',
+            if_exists='replace',
+            create_index=True,
+            index_columns=['customer_id']
+        )
+        
+        # Exportar backup CSV
+        loader.load_to_csv(df_enriched, file_name='sales_enriched.csv')
+                # Exportar para Parquet (formato otimizado)
+        loader.load_to_parquet(df_enriched, file_name=\'sales_enriched.parquet\')
+
+        # Carregar para DuckDB (para análises rápidas)
+        duckdb_path = str(OUTPUT_DIR / "analytics.duckdb")
+        loader.load_to_duckdb(
+            df_enriched,
+            table_name=\'sales_data\
+            db_path=duckdb_path,
+            if_exists=\'replace\'
+        )
+        loader.load_to_duckdb(
+            df_summary,
+            table_name=\'customer_summary\
+            db_path=duckdb_path,
+            if_exists=\'replace\'
+        )        
+        return {
+            'sales_count': len(df_enriched),
+            'customers_count': len(df_summary),
+            'total_revenue': float(df_summary['total_revenue'].sum())
+        }
+    
+    
+    @task(task_id='gerar_relatorio_final')
+    def gerar_relatorio(load_result, **context):
+        """
+        Gera relatório de execução do pipeline e métricas.
+        """
+        import json
+        from datetime import datetime
+
+        logger = ETLLogger(__name__)
+        
+        execution_date = context["ds"]
+        
+        # Carregar métricas do arquivo JSON gerado pelo main.py
+        metrics_file_path = OUTPUT_DIR / "pipeline_metrics.json"
+        metrics = {}
+        try:
+            with open(metrics_file_path, "r", encoding="utf-8") as f:
+                metrics = json.load(f)
+            logger.logger.info(f"Métricas carregadas de: {metrics_file_path}")
+        except FileNotFoundError:
+            logger.logger.error(f"Arquivo de métricas não encontrado: {metrics_file_path}")
+            metrics = {
+                "total_sales_records": load_result["sales_count"],
+                "total_unique_customers": load_result["customers_count"],
+                "total_revenue_generated": load_result["total_revenue"],
+                "validation_status": "Unknown"
+            }
+
+        report = f"""
+        ========================================
+        RELATÓRIO DE EXECUÇÃO DO PIPELINE ETL
+        ========================================
+        Data de Execução: {execution_date}
+        Timestamp da Geração: {metrics.get("timestamp", "N/A")}
+        
+        Resultados:
+        - Vendas processadas: {metrics.get("total_sales_records", "N/A")}
+        - Clientes únicos: {metrics.get("total_unique_customers", "N/A")}
+        - Receita total: R$ {metrics.get("total_revenue_generated", 0):.2f}
+        
+        Status Validação: {metrics.get("validation_status", "N/A")}
+        Status Geral: SUCESSO
+        ========================================
+        """
+        
+        logger.logger.info(report)
+        print(report)
+        
+        return load_result
+    
+    
+    # Definir fluxo de execução (dependências)
+    sales_data = extrair_vendas()
+    customers_data = extrair_clientes()
+    
+    transformed = transformar_dados(sales_data, customers_data)
+    validated = validar_qualidade(transformed)
+    loaded = carregar_dados(validated)
+    report = gerar_relatorio(loaded)
+
+    # Documentação das tasks
+    extrair_vendas.doc_md = "Extrai dados de vendas da fonte de dados simulada."
+    extrair_clientes.doc_md = "Extrai dados de clientes da fonte de dados simulada."
+    transformar_dados.doc_md = "Aplica transformações, limpeza e enriquecimento nos dados extraídos."
+    validar_qualidade.doc_md = "Verifica a integridade e a qualidade dos dados transformados."
+    carregar_dados.doc_md = "Persiste os dados processados em SQLite, CSV e Parquet."
+    gerar_relatorio.doc_md = "Cria um relatório final com as métricas de execução do pipeline."

@@ -1,0 +1,10 @@
+# Dependências principais do Pipeline ETL
+pandas==2.1.4
+numpy==1.26.2
+SQLAlchemy==2.0.23
+requests==2.31.0
+tenacity==8.2.3
+python-dotenv==1.0.0
+pyarrow==14.0.1
+
+duckdb==0.10.0 # ou a versão mais recente compatível
