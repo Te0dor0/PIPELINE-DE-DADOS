@@ -106,7 +106,7 @@ O pipeline gera relatórios de execução e logs detalhados. Em caso de falhas, 
 
 **Diego Teodoro**
 - Linkedin: www.linkedin.com/in/diego-teodoro-ti
-- GitHub: https://github.com/diego-teodoro
+- GitHub: https://github.com/Te0dor0
 
 ---
 *Este projeto foi desenvolvido para demonstrar habilidades avançadas em Engenharia de Dados usando o ecossistema Python.*
